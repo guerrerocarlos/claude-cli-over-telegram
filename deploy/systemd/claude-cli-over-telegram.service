@@ -1,0 +1,23 @@
+[Unit]
+Description=Claude CLI over Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gnu
+Group=gnu
+WorkingDirectory=/home/gnu/claude-cli-over-telegram
+Environment=HOME=/home/gnu
+EnvironmentFile=/etc/claude-cli-over-telegram/env
+EnvironmentFile=-/etc/claude-cli-over-telegram/deploy.env
+ExecStart=/usr/bin/node /home/gnu/claude-cli-over-telegram/dist/index.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/gnu
+
+[Install]
+WantedBy=multi-user.target
