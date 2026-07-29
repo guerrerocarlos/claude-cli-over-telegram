@@ -17,6 +17,8 @@
   - Fleet backup units: `deploy/systemd/claude-cli-over-telegram-fleet-backup.service` and `.timer`.
   - Cron scheduler runs inside `claude-cli-over-telegram.service` every minute and queues due jobs through the same per-topic `RunQueue`.
 - The live env stores `MANAGER_BRIDGE_URL=http://127.0.0.1:8789/bridge` and `MANAGER_REPO_PATH=/home/gnu/claude-manager`.
+- The fleet backup timer `claude-cli-over-telegram-fleet-backup.timer` is enabled and active. Next scheduled run after verification was `2026-07-30 03:17:00 -03`.
+- Manual fleet backup verification wrote `/home/gnu/claude-manager/snapshots/telegram-state/latest.json` and a timestamped snapshot. The manager repo is snapshot-only for now with `COMMIT_FLEET_BACKUP=false` and `PUSH_FLEET_BACKUP=false`.
 - `8787` is occupied by `codex-cli-over-telegram` and `8788` is occupied by `w7s-docker`, so this service uses health port `8789`.
 - Deployment verified on 2026-07-29 with `NRestarts=0`, webhook URL empty, and polling active. Use live `/health` for the exact current `branch`, `commitHash`, and `deployedAt`.
 - Backported useful operational hardening from `/home/gnu/codex-cli-over-telegram`:

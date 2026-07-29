@@ -153,6 +153,14 @@ sudo systemctl enable --now claude-cli-over-telegram-fleet-backup.timer
 
 The unit writes to `/home/gnu/claude-manager` and defaults to `PUSH_FLEET_BACKUP=false` until that manager repo is intentionally initialized.
 
+Check the timer:
+
+```bash
+systemctl is-enabled claude-cli-over-telegram-fleet-backup.timer
+systemctl show claude-cli-over-telegram-fleet-backup.timer \
+  -p ActiveState -p UnitFileState -p NextElapseUSecRealtime --no-pager
+```
+
 ## Inspect Active Runs
 
 ```bash
