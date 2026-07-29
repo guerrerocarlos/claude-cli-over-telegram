@@ -66,6 +66,8 @@ The packaged production unit is `deploy/systemd/claude-cli-over-telegram.service
 
 The live bot username is `@T4jsBot`. Keep the token out of repo files; it belongs in `/etc/claude-cli-over-telegram/env`.
 
+When topics are enabled on a newly created group, Telegram may upgrade it to a supergroup and assign a new chat id. If messages stop doing anything after enabling topics, inspect `audit_events` for `unauthorized_chat` and add the new `chat_id` to `ALLOWED_TELEGRAM_CHAT_IDS`, then restart or redeploy the service.
+
 Verify Telegram API and polling/webhook state without printing secrets:
 
 ```bash
