@@ -68,6 +68,12 @@ The live bot username is `@T4jsBot`. Keep the token out of repo files; it belong
 
 When topics are enabled on a newly created group, Telegram may upgrade it to a supergroup and assign a new chat id. If messages stop doing anything after enabling topics, inspect `audit_events` for `unauthorized_chat` and add the new `chat_id` to `ALLOWED_TELEGRAM_CHAT_IDS`, then restart or redeploy the service.
 
+The current `RPOTENTIAL CLAUDE` group uses `-5540205154` before upgrade and `-1004368289137` after upgrade. Check the live allowlist without printing secrets:
+
+```bash
+sudo awk -F= '$1 == "ALLOWED_TELEGRAM_CHAT_IDS" { print }' /etc/claude-cli-over-telegram/env
+```
+
 If topic messages are sent as an anonymous admin, Telegram reports the sender as `GroupAnonymousBot` (`1087968824`). Inspect `audit_events` for `unauthorized_message`; either disable anonymous admin posting in Telegram or include `1087968824` in `ALLOWED_TELEGRAM_USER_IDS`.
 
 For ordinary non-command messages in group topics, BotFather privacy mode must be disabled for `@T4jsBot`. Verify with `getMe`: `can_read_all_group_messages` must be `true`. If it is `false`, use BotFather:

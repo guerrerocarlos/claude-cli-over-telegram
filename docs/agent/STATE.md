@@ -9,7 +9,7 @@
 - `scripts/deploy.sh` writes `DEPLOY_BRANCH`, `DEPLOY_COMMIT_HASH`, and `DEPLOYED_AT` to `/etc/claude-cli-over-telegram/deploy.env`, restarts the systemd service, and verifies the configured `HEALTH_URL`.
 - The service uses `/home/gnu/.local/state/claude-cli-over-telegram/state.sqlite` for runtime SQLite state.
 - The service is configured with `ALLOWED_REPO_ROOTS=/home/gnu`, `CLAUDE_BIN=/home/gnu/.local/bin/claude`, `CLAUDE_ALWAYS_YOLO=true`, and `ALLOW_UNTHREADED_CHATS=true` to match the local Codex bot operating style.
-- The live `ALLOWED_TELEGRAM_CHAT_IDS` includes `-5577885365` for the original new Claude Telegram group id and `-1004345845361` for the supergroup id Telegram assigned after topics were enabled, alongside the previously authorized groups.
+- The live `ALLOWED_TELEGRAM_CHAT_IDS` includes `-5577885365` for the earlier Claude group id, `-1004345845361` for that group's supergroup id after topics were enabled, `-5540205154` for the `RPOTENTIAL CLAUDE` group id, and `-1004368289137` for the `RPOTENTIAL CLAUDE` supergroup id after Telegram upgraded it.
 - The live `ALLOWED_TELEGRAM_USER_IDS` includes `63272048` for `@guerrerocarlos` and `1087968824` for Telegram's `GroupAnonymousBot`, because topic messages sent as an anonymous admin arrive from that Telegram identity.
 - Telegram `getMe` reports `can_read_all_group_messages=true` for `@T4jsBot` after BotFather privacy mode was disabled. Ordinary group-topic messages should now reach the bot.
 - Inbound accepted text and outbound command replies are logged, and outbound replies are also recorded in `topic_messages` with `direction='out'` for delivery debugging.
