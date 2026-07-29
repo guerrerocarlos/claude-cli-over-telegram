@@ -13,7 +13,7 @@ npm run build
 ## Health Check
 
 ```bash
-curl -fsS http://127.0.0.1:8787/health
+curl -fsS http://127.0.0.1:8789/health
 ```
 
 Expected production metadata fields:
@@ -22,7 +22,7 @@ Expected production metadata fields:
 - `commitHash`
 - `deployedAt`
 
-Local development may return `unknown` for deployment metadata.
+Local development may return `unknown` for deployment metadata. On this host, `8787` is used by `codex-cli-over-telegram` and `8788` is used by `w7s-docker`, so the Claude bot uses `8789`.
 
 ## Deploy
 
@@ -40,8 +40,14 @@ SERVICE_GROUP=gnu \
 APP_DIR=/home/gnu/claude-cli-over-telegram \
 ENV_DIR=/etc/claude-cli-over-telegram \
 STATE_DIR=/home/gnu/.local/state/claude-cli-over-telegram \
-HEALTH_URL=http://127.0.0.1:8787/health \
+HEALTH_URL=http://127.0.0.1:8789/health \
 ./scripts/deploy.sh
+```
+
+On this host, deploy with the live health port:
+
+```bash
+HEALTH_URL=http://127.0.0.1:8789/health ./scripts/deploy.sh
 ```
 
 ## Service Status
@@ -55,12 +61,26 @@ journalctl -u claude-cli-over-telegram.service -f
 
 The packaged production unit is `deploy/systemd/claude-cli-over-telegram.service`.
 
+## Telegram Bot
+
+The live bot username is `@T4jsBot`. Keep the token out of repo files; it belongs in `/etc/claude-cli-over-telegram/env`.
+
+Verify Telegram API and polling/webhook state without printing secrets:
+
+```bash
+TOKEN="$(sudo awk -F= '$1 == "TELEGRAM_BOT_TOKEN" { print $2 }' /etc/claude-cli-over-telegram/env)"
+curl -fsS "https://api.telegram.org/bot${TOKEN}/getMe"
+curl -fsS "https://api.telegram.org/bot${TOKEN}/getWebhookInfo"
+```
+
+The expected webhook URL is empty because the service uses long polling.
+
 ## Inspect Active Runs
 
 ```bash
 node - <<'NODE'
 const Database = require('better-sqlite3');
-const db = new Database('data/state.sqlite', { readonly: true });
+const db = new Database('/home/gnu/.local/state/claude-cli-over-telegram/state.sqlite', { readonly: true });
 console.log(JSON.stringify(db.prepare(`
   SELECT r.id, r.binding_id, b.topic_name, b.chat_id, b.message_thread_id,
          b.repo_path, r.status, r.started_at, r.completed_at, r.error_message,
@@ -88,7 +108,7 @@ Inspect the affected binding/run:
 RUN_ID=1
 node - <<'NODE'
 const Database = require('better-sqlite3');
-const db = new Database('data/state.sqlite', { readonly: true });
+const db = new Database('/home/gnu/.local/state/claude-cli-over-telegram/state.sqlite', { readonly: true });
 const runId = Number(process.env.RUN_ID);
 console.log(JSON.stringify(db.prepare(`
   SELECT r.id, r.status, r.error_message, b.id AS binding_id, b.topic_name,
