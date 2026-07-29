@@ -70,6 +70,16 @@ When topics are enabled on a newly created group, Telegram may upgrade it to a s
 
 If topic messages are sent as an anonymous admin, Telegram reports the sender as `GroupAnonymousBot` (`1087968824`). Inspect `audit_events` for `unauthorized_message`; either disable anonymous admin posting in Telegram or include `1087968824` in `ALLOWED_TELEGRAM_USER_IDS`.
 
+For ordinary non-command messages in group topics, BotFather privacy mode must be disabled for `@T4jsBot`. Verify with `getMe`: `can_read_all_group_messages` must be `true`. If it is `false`, use BotFather:
+
+```text
+/setprivacy
+@T4jsBot
+Disable
+```
+
+Until privacy is disabled, use commands such as `/help`, `/where`, `/bind /home/gnu/path`, or `/ask prompt text`; Telegram will not deliver plain group messages to the bot.
+
 Verify Telegram API and polling/webhook state without printing secrets:
 
 ```bash
