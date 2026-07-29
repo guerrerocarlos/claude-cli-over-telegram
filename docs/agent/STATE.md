@@ -10,6 +10,7 @@
 - The service uses `/home/gnu/.local/state/claude-cli-over-telegram/state.sqlite` for runtime SQLite state.
 - The service is configured with `ALLOWED_REPO_ROOTS=/home/gnu`, `CLAUDE_BIN=/home/gnu/.local/bin/claude`, `CLAUDE_ALWAYS_YOLO=true`, and `ALLOW_UNTHREADED_CHATS=true` to match the local Codex bot operating style.
 - The live `ALLOWED_TELEGRAM_CHAT_IDS` includes `-5577885365` for the original new Claude Telegram group id and `-1004345845361` for the supergroup id Telegram assigned after topics were enabled, alongside the previously authorized groups.
+- The live `ALLOWED_TELEGRAM_USER_IDS` includes `63272048` for `@guerrerocarlos` and `1087968824` for Telegram's `GroupAnonymousBot`, because topic messages sent as an anonymous admin arrive from that Telegram identity.
 - The manager/control-plane system is ported from `codex-cli-over-telegram` for this Claude bot:
   - Telegram commands: `/dashboard`, `/topics`, `/todo`, `/work`, `/work_add`, `/work_done`, `/work_blocked`, `/work_cancel`, `/queue_topic`, `/assign`, and `/cron`.
   - Authenticated HTTP bridge: `POST http://127.0.0.1:8789/bridge` with `MANAGER_BRIDGE_TOKEN` from `/etc/claude-cli-over-telegram/env`.
