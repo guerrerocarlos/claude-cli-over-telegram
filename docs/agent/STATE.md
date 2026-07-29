@@ -9,6 +9,7 @@
 - `scripts/deploy.sh` writes `DEPLOY_BRANCH`, `DEPLOY_COMMIT_HASH`, and `DEPLOYED_AT` to `/etc/claude-cli-over-telegram/deploy.env`, restarts the systemd service, and verifies the configured `HEALTH_URL`.
 - The service uses `/home/gnu/.local/state/claude-cli-over-telegram/state.sqlite` for runtime SQLite state.
 - The service is configured with `ALLOWED_REPO_ROOTS=/home/gnu`, `CLAUDE_BIN=/home/gnu/.local/bin/claude`, `CLAUDE_ALWAYS_YOLO=true`, and `ALLOW_UNTHREADED_CHATS=true` to match the local Codex bot operating style.
+- The live `ALLOWED_TELEGRAM_CHAT_IDS` includes `-5577885365` for the new Claude Telegram group, alongside the previously authorized groups.
 - The manager/control-plane system is ported from `codex-cli-over-telegram` for this Claude bot:
   - Telegram commands: `/dashboard`, `/topics`, `/todo`, `/work`, `/work_add`, `/work_done`, `/work_blocked`, `/work_cancel`, `/queue_topic`, `/assign`, and `/cron`.
   - Authenticated HTTP bridge: `POST http://127.0.0.1:8789/bridge` with `MANAGER_BRIDGE_TOKEN` from `/etc/claude-cli-over-telegram/env`.
@@ -27,4 +28,4 @@
   - Telegram send queue retries chat migrations, rate limits, and transient network failures;
   - long MarkdownV2 output is packed into full Telegram-safe chunks instead of many tiny messages;
   - consecutive short Claude assistant messages are batched before sending.
-- Codex-specific bridge, fleet, work-item, cron, provider-tier, and app-server features remain out of scope for this Claude-only service unless explicitly requested.
+- Codex-specific provider-tier and app-server features remain out of scope for this Claude-only service unless explicitly requested.
