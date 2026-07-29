@@ -78,6 +78,7 @@ interface CreateTelegramBotOptions {
 }
 
 const sendQueues = new WeakMap<AppConfig, TelegramSendQueue>();
+const replyStorages = new WeakMap<AppConfig, Storage>();
 
 export function createTelegramBot(
   config: AppConfig,
@@ -88,6 +89,7 @@ export function createTelegramBot(
   const bot = new Bot(config.telegramBotToken);
   const queue = options.queue ?? new RunQueue(config.maxParallelRuns);
   const sendQueue = sendQueueFor(config);
+  replyStorages.set(config, storage);
 
   bot.use(async (ctx, next) => {
     const fromId = ctx.from?.id;
@@ -158,6 +160,14 @@ export function createTelegramBot(
         authorId: fromId,
         authorName: formatTelegramUser(ctx.from),
         text,
+      });
+      logger.info("telegram inbound text accepted", {
+        chatId: topic.chatId,
+        messageThreadId: topic.messageThreadId,
+        telegramMessageId: ctx.message?.message_id ?? null,
+        fromId,
+        textLength: text.length,
+        isCommand: text.trimStart().startsWith("/"),
       });
     }
 
@@ -739,7 +749,11 @@ export function createTelegramBot(
   });
 
   bot.catch((error) => {
-    logger.error("telegram bot error", { error: String(error.error) });
+    logger.error("telegram bot error", {
+      error: errorMessage(error.error),
+      stack: error.error instanceof Error ? error.error.stack : null,
+      updateId: error.ctx.update.update_id,
+    });
   });
 
   if (options.recoverRuns?.length) {
@@ -2227,7 +2241,31 @@ async function reply(
             parse_mode: "MarkdownV2" as const,
             disable_notification: true,
           };
-    await sendQueue.sendMessage(ctx.api, chatId, chunk, options);
+    try {
+      const message = await sendQueue.sendMessage(ctx.api, chatId, chunk, options);
+      replyStorages.get(config)?.addTopicMessage({
+        chatId,
+        messageThreadId: typeof messageThreadId === "number" ? messageThreadId : 0,
+        telegramMessageId: message.message_id,
+        direction: "out",
+        authorId: ctx.me.id,
+        authorName: `@${ctx.me.username} / ${ctx.me.first_name} / ${ctx.me.id}`,
+        text,
+      });
+      logger.info("telegram reply sent", {
+        chatId,
+        messageThreadId: typeof messageThreadId === "number" ? messageThreadId : null,
+        telegramMessageId: message.message_id,
+        textLength: chunk.length,
+      });
+    } catch (error) {
+      logger.error("telegram reply failed", {
+        chatId,
+        messageThreadId: typeof messageThreadId === "number" ? messageThreadId : null,
+        error: errorMessage(error),
+      });
+      throw error;
+    }
   }
 }
 
