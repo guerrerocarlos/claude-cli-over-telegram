@@ -1,4 +1,5 @@
 export function chunkText(text: string, maxChars: number): string[] {
+  text = wellFormedText(text);
   if (text.length <= maxChars) {
     return [text];
   }
@@ -22,6 +23,7 @@ export function chunkText(text: string, maxChars: number): string[] {
 }
 
 export function truncateText(text: string, maxChars: number): string {
+  text = wellFormedText(text);
   if (text.length <= maxChars) {
     return text;
   }
@@ -33,29 +35,35 @@ const codeBlockSeparator = "\u001f";
 const codeBlockEnd = "\u001e";
 
 export function codeBlock(text: string, language = ""): string {
-  const body = text.trimEnd() || " ";
+  const body = wellFormedText(text).trimEnd() || " ";
   return `${codeBlockStart}${language}${codeBlockSeparator}${body}${codeBlockEnd}`;
 }
 
 export function markdownV2Chunks(text: string, maxChars: number): string[] {
+  text = wellFormedText(text);
   const rendered = renderMarkdownV2(text);
   if (rendered.length <= maxChars) {
     return [rendered];
   }
 
-  const chunks: string[] = [];
+  const renderedSegments: string[] = [];
   for (const segment of parseMarkdownSegments(text)) {
     if (segment.type === "text") {
-      chunks.push(...chunkEscapedText(escapeMarkdownV2Text(segment.text), maxChars));
+      renderedSegments.push(...chunkEscapedText(escapeMarkdownV2Text(segment.text), maxChars));
+    } else if (segment.type === "bold") {
+      const rendered = renderBold(segment.body);
+      renderedSegments.push(
+        ...(rendered.length <= maxChars ? [rendered] : chunkEscapedText(escapeMarkdownV2Text(segment.body), maxChars)),
+      );
     } else if (segment.type === "inlineCode") {
       const rendered = renderInlineCode(segment.body);
-      chunks.push(...(rendered.length <= maxChars ? [rendered] : chunkCodeBlock(segment.body, "", maxChars)));
+      renderedSegments.push(...(rendered.length <= maxChars ? [rendered] : chunkCodeBlock(segment.body, "", maxChars)));
     } else {
-      chunks.push(...chunkCodeBlock(segment.body, segment.language, maxChars));
+      renderedSegments.push(...chunkCodeBlock(segment.body, segment.language, maxChars));
     }
   }
 
-  return chunks.filter((chunk) => chunk.trim().length > 0);
+  return packMarkdownChunks(renderedSegments, maxChars);
 }
 
 function renderMarkdownV2(text: string): string {
@@ -63,6 +71,9 @@ function renderMarkdownV2(text: string): string {
     .map((segment) => {
       if (segment.type === "text") {
         return escapeMarkdownV2Text(segment.text);
+      }
+      if (segment.type === "bold") {
+        return renderBold(segment.body);
       }
       if (segment.type === "inlineCode") {
         return renderInlineCode(segment.body);
@@ -74,6 +85,7 @@ function renderMarkdownV2(text: string): string {
 
 type MarkdownSegment =
   | { type: "text"; text: string }
+  | { type: "bold"; body: string }
   | { type: "inlineCode"; body: string }
   | { type: "code"; language: string; body: string };
 
@@ -133,20 +145,49 @@ function appendTextSegments(segments: MarkdownSegment[], text: string): void {
 }
 
 function appendInlineTextSegments(segments: MarkdownSegment[], text: string): void {
-  const inlineCodePattern = /`([^`\n]+)`/g;
   let cursor = 0;
-  let match: RegExpExecArray | null;
 
-  while ((match = inlineCodePattern.exec(text)) !== null) {
-    if (match.index > cursor) {
-      segments.push({ type: "text", text: text.slice(cursor, match.index) });
+  while (cursor < text.length) {
+    const codeStart = text.indexOf("`", cursor);
+    const boldStart = text.indexOf("**", cursor);
+    const start = minNonNegative(codeStart, boldStart);
+
+    if (start === -1) {
+      segments.push({ type: "text", text: text.slice(cursor) });
+      break;
     }
-    segments.push({ type: "inlineCode", body: match[1] ?? "" });
-    cursor = inlineCodePattern.lastIndex;
-  }
 
-  if (cursor < text.length) {
-    segments.push({ type: "text", text: text.slice(cursor) });
+    if (start > cursor) {
+      segments.push({ type: "text", text: text.slice(cursor, start) });
+    }
+
+    if (start === codeStart) {
+      const end = text.indexOf("`", codeStart + 1);
+      if (end === -1 || text.slice(codeStart + 1, end).includes("\n")) {
+        segments.push({ type: "text", text: text.slice(codeStart, codeStart + 1) });
+        cursor = codeStart + 1;
+        continue;
+      }
+
+      segments.push({ type: "inlineCode", body: text.slice(codeStart + 1, end) });
+      cursor = end + 1;
+      continue;
+    }
+
+    const end = text.indexOf("**", boldStart + 2);
+    if (end === -1) {
+      segments.push({ type: "text", text: text.slice(boldStart, boldStart + 2) });
+      cursor = boldStart + 2;
+      continue;
+    }
+
+    const body = text.slice(boldStart + 2, end);
+    if (body.trim()) {
+      segments.push({ type: "bold", body });
+    } else {
+      segments.push({ type: "text", text: text.slice(boldStart, end + 2) });
+    }
+    cursor = end + 2;
   }
 }
 
@@ -164,6 +205,47 @@ function renderCodeBlock(body: string, language: string): string {
 
 function renderInlineCode(body: string): string {
   return `\`${escapeMarkdownV2Code(body)}\``;
+}
+
+function renderBold(body: string): string {
+  return `*${escapeMarkdownV2Text(body)}*`;
+}
+
+function wellFormedText(text: string): string {
+  const maybeWellFormed = text as string & { toWellFormed?: () => string };
+  if (typeof maybeWellFormed.toWellFormed === "function") {
+    return maybeWellFormed.toWellFormed();
+  }
+
+  let output = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        output += text[index] ?? "";
+        output += text[index + 1] ?? "";
+        index += 1;
+      } else {
+        output += "\ufffd";
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      output += "\ufffd";
+    } else {
+      output += text[index] ?? "";
+    }
+  }
+  return output;
+}
+
+function minNonNegative(left: number, right: number): number {
+  if (left === -1) {
+    return right;
+  }
+  if (right === -1) {
+    return left;
+  }
+  return Math.min(left, right);
 }
 
 function sanitizeCodeLanguage(language: string): string {
@@ -200,6 +282,35 @@ function endsWithDanglingEscape(text: string): boolean {
     slashCount += 1;
   }
   return slashCount % 2 === 1;
+}
+
+function packMarkdownChunks(segments: string[], maxChars: number): string[] {
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const segment of segments) {
+    if (current.length > 0 && current.length + segment.length > maxChars) {
+      chunks.push(current);
+      current = "";
+    }
+
+    if (segment.length > maxChars) {
+      if (current.length > 0) {
+        chunks.push(current);
+        current = "";
+      }
+      chunks.push(segment);
+      continue;
+    }
+
+    current += segment;
+  }
+
+  if (current.trim()) {
+    chunks.push(current);
+  }
+
+  return chunks;
 }
 
 function chunkCodeBlock(body: string, language: string, maxChars: number): string[] {

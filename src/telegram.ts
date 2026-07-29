@@ -894,13 +894,22 @@ async function resumeInterruptedRuns(
         details: { runId: run.id, repoPath: freshBinding.repoPath },
       });
 
-      await sendText(
-        bot,
-        config,
-        freshBinding,
-        resumeNoticeText(run),
-        { notify: true },
-      );
+      try {
+        await sendText(
+          bot,
+          config,
+          freshBinding,
+          resumeNoticeText(run),
+          { notify: true },
+        );
+      } catch (error) {
+        logger.warn("failed to send restart resume notice", {
+          runId: run.id,
+          chatId: freshBinding.chatId,
+          messageThreadId: freshBinding.messageThreadId,
+          error: errorMessage(error),
+        });
+      }
       await executeRun(bot, config, storage, claude, freshBinding, run, resumePromptForRun(run));
     });
   }
@@ -935,6 +944,10 @@ function resumePromptForRun(run: InterruptedRunRecord): string {
   ].join("\n");
 }
 
+const agentMessageBatchMinChars = 600;
+const agentMessageBatchMaxChars = 1200;
+const agentMessageBatchMaxCount = 4;
+
 async function executeRun(
   bot: Bot,
   config: AppConfig,
@@ -947,7 +960,18 @@ async function executeRun(
   let lockAcquired = false;
   let finalMessage = "";
   let lastSentAgentMessage = "";
+  const pendingAgentMessages: string[] = [];
   let lastProgressAt = 0;
+
+  const flushAgentMessages = async (options: SendOptions = {}): Promise<void> => {
+    const text = pendingAgentMessages.join("\n\n").trim();
+    pendingAgentMessages.length = 0;
+    if (!text || text === lastSentAgentMessage) {
+      return;
+    }
+    await sendText(bot, config, binding, text, options);
+    lastSentAgentMessage = text;
+  };
 
   try {
     const sandboxMode = effectiveSandboxMode(config, binding.sandboxMode);
@@ -994,19 +1018,39 @@ async function executeRun(
 
       if (event.type === "agent_message") {
         finalMessage = event.text;
-        if (event.text.trim() && event.text !== lastSentAgentMessage) {
-          await sendText(bot, config, binding, event.text);
-          lastSentAgentMessage = event.text;
+        const text = event.text.trim();
+        if (!text) {
+          continue;
+        }
+
+        if (text.length >= agentMessageBatchMinChars) {
+          await flushAgentMessages();
+          if (text !== lastSentAgentMessage) {
+            await sendText(bot, config, binding, text);
+            lastSentAgentMessage = text;
+          }
+          continue;
+        }
+
+        pendingAgentMessages.push(text);
+        const batchText = pendingAgentMessages.join("\n\n");
+        if (
+          pendingAgentMessages.length >= agentMessageBatchMaxCount ||
+          batchText.length >= agentMessageBatchMaxChars
+        ) {
+          await flushAgentMessages();
         }
         continue;
       }
 
       if (event.type === "command_started") {
+        await flushAgentMessages();
         await sendText(bot, config, binding, codeBlock(truncateText(event.text, 900), "bash"));
         continue;
       }
 
       if (event.type === "command_completed") {
+        await flushAgentMessages();
         if (event.text.trim()) {
           await sendText(bot, config, binding, codeBlock(truncateText(event.text, 1200)));
         }
@@ -1014,6 +1058,7 @@ async function executeRun(
       }
 
       if (event.type === "file_changed") {
+        await flushAgentMessages();
         await sendText(bot, config, binding, `Changed:\n${codeBlock(event.text)}`);
         continue;
       }
@@ -1028,6 +1073,7 @@ async function executeRun(
       }
 
       if (event.type === "failed") {
+        await flushAgentMessages();
         storage.failRun(run.id, event.error, event.exitCode ?? null);
         await sendText(
           bot,
@@ -1046,13 +1092,18 @@ async function executeRun(
 
     const completionMessage = finalMessage || "Claude completed without a final message.";
     storage.completeRun(run.id, completionMessage);
-    await sendText(
-      bot,
-      config,
-      binding,
-      completionMessage === lastSentAgentMessage ? "Done." : completionMessage,
-      { notify: true },
-    );
+    if (pendingAgentMessages.length > 0 && pendingAgentMessages.at(-1) === completionMessage.trim()) {
+      await flushAgentMessages({ notify: true });
+    } else {
+      await flushAgentMessages();
+      await sendText(
+        bot,
+        config,
+        binding,
+        completionMessage === lastSentAgentMessage ? "Done." : completionMessage,
+        { notify: true },
+      );
+    }
   } catch (error) {
     const message = errorMessage(error);
     storage.failRun(run.id, message);
