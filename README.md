@@ -81,6 +81,14 @@ Useful commands:
 /push
 /ask do something specific
 /queue do this after the current run
+/dashboard
+/topics
+/todo
+/work
+/work_add <title>
+/queue_topic <topic-id-or-name> <prompt>
+/assign <topic-id-or-name> <prompt>
+/cron 0 * * * * recurring prompt
 ```
 
 Normal messages in a bound chat/topic are sent to Claude. While a run is active, use `/queue <prompt>` when you want the message to wait as the next turn. Use `/ask` if Telegram privacy mode prevents the bot from seeing ordinary group messages.
@@ -96,6 +104,19 @@ Voice messages are saved into `.context/`, converted with `ffmpeg` when Telegram
 The bot pins the message that triggers each run and leaves the latest prompt pinned after completion so the task remains easy to find.
 
 If the service restarts while runs are queued or active, it requeues those saved runs on startup and posts a notice in each affected Telegram topic. Queued runs start from the saved prompt. Interrupted running runs resume the saved Claude thread with a continue-style prompt instead of replaying the original prompt from scratch.
+
+## Manager Control Plane
+
+Claude CLI over Telegram includes the same generic Telegram manager surface as the Codex bot:
+
+- `/dashboard`, `/topics`, and `/todo` inspect topic, run, and work state across a chat.
+- `/work*` commands create and update persistent work items.
+- `/queue_topic` and `/assign` queue prompts into another bound topic.
+- `/cron` creates, lists, and disables recurring prompts.
+- `POST /bridge` exposes the same actions to local tooling with `MANAGER_BRIDGE_TOKEN`.
+- `npm run fleet:export`, `npm run fleet:restore`, and `npm run fleet:backup` export or restore sanitized fleet state.
+
+Keep `MANAGER_BRIDGE_TOKEN` in the system env file, not in git.
 
 ## YOLO Mode
 
@@ -237,6 +258,8 @@ Claude CLI over Telegram exposes:
 ```bash
 curl -fsS http://127.0.0.1:8787/health
 ```
+
+On the shared `/home/gnu` host, this service currently uses `HEALTH_PORT=8789` because `8787` is used by `codex-cli-over-telegram`.
 
 ## Security
 

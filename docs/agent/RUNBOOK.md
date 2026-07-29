@@ -6,6 +6,7 @@
 npm ci
 npm test
 npm run build
+npm run fleet
 ```
 
 `npm test` runs TypeScript typecheck with `tsc -p tsconfig.json --noEmit`.
@@ -74,6 +75,83 @@ curl -fsS "https://api.telegram.org/bot${TOKEN}/getWebhookInfo"
 ```
 
 The expected webhook URL is empty because the service uses long polling.
+
+## Manager Bridge
+
+The HTTP bridge is protected by `MANAGER_BRIDGE_TOKEN` in `/etc/claude-cli-over-telegram/env`.
+
+List bound topics through the bridge:
+
+```bash
+TOKEN="$(sudo awk -F= '$1 == "MANAGER_BRIDGE_TOKEN" { print $2 }' /etc/claude-cli-over-telegram/env)"
+curl -fsS \
+  -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"action":"list_topics","chatId":-1004361900873}' \
+  http://127.0.0.1:8789/bridge
+```
+
+Available bridge actions:
+
+- `list_topics`
+- `queue_topic`
+- `read_topic_messages`
+- `create_topic`
+- `create_cron`
+- `list_crons`
+- `delete_cron`
+- `create_work_item`
+- `list_work_items`
+- `update_work_item`
+- `complete_work_item`
+
+The MCP bridge binary is `claude-telegram-manager-bridge-mcp`. It reads `/etc/claude-cli-over-telegram/env`, uses `MANAGER_BRIDGE_URL`/`MANAGER_BRIDGE_TOKEN`, and infers chat scope from `MANAGER_BRIDGE_CHAT_ID` or the current repo path's live binding. It does not inspect other process environments.
+
+## Cron Scheduler
+
+Cron jobs live in the runtime SQLite table `cron_jobs` and are evaluated by the service every minute.
+
+Telegram commands:
+
+```text
+/cron 0 * * * * check this topic
+/cron topic-name 0 9 * * 1-5 summarize open work
+/cron list
+/cron off 3
+```
+
+The scheduler queues due prompts through the same per-topic run queue used by Telegram messages, so restarts recover queued/running work through the normal startup path.
+
+## Fleet CLI
+
+Export a sanitized snapshot:
+
+```bash
+npm run build
+npm run fleet:export -- \
+  --database /home/gnu/.local/state/claude-cli-over-telegram/state.sqlite \
+  --out /home/gnu/claude-manager/snapshots/telegram-state/latest.json
+```
+
+Backup into a manager repo:
+
+```bash
+npm run fleet:backup -- \
+  --manager-repo /home/gnu/claude-manager \
+  --database /home/gnu/.local/state/claude-cli-over-telegram/state.sqlite \
+  --no-commit
+```
+
+Systemd backup units are available but not enabled by default:
+
+```bash
+sudo cp deploy/systemd/claude-cli-over-telegram-fleet-backup.service /etc/systemd/system/
+sudo cp deploy/systemd/claude-cli-over-telegram-fleet-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-cli-over-telegram-fleet-backup.timer
+```
+
+The unit writes to `/home/gnu/claude-manager` and defaults to `PUSH_FLEET_BACKUP=false` until that manager repo is intentionally initialized.
 
 ## Inspect Active Runs
 

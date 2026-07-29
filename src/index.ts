@@ -2,23 +2,43 @@
 import { loadConfig } from "./config.js";
 import { Storage } from "./storage.js";
 import { ClaudeExecBackend } from "./claudeExec.js";
-import { createTelegramBot, telegramCommandMenu } from "./telegram.js";
+import { createTelegramBot, handleTelegramBridgeRequest, resumeInterruptedRuns, telegramCommandMenu } from "./telegram.js";
 import { startHealthServer } from "./health.js";
 import { logger } from "./logger.js";
+import { RunQueue } from "./runQueue.js";
+import { CronScheduler } from "./cronScheduler.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const storage = new Storage(config.databasePath);
   const interruptedRuns = storage.prepareInterruptedRunsForResume();
+  const queue = new RunQueue(config.maxParallelRuns);
 
-  const healthServer = startHealthServer(config);
   const claude = new ClaudeExecBackend(config.claudeBin);
-  const bot = createTelegramBot(config, storage, claude, { recoverRuns: interruptedRuns });
+  const healthServer = startHealthServer(config, async (request) =>
+    handleTelegramBridgeRequest({
+      storage,
+      bot,
+      config,
+      claude,
+      queue,
+      request,
+    }),
+  );
+  const bot = createTelegramBot(config, storage, claude, { queue });
+  const cronScheduler = new CronScheduler({ storage, bot, config, claude, queue });
 
   const shutdown = async (signal: string) => {
     logger.info("shutting down", { signal });
+    cronScheduler.stop();
     healthServer.close();
-    await bot.stop();
+    try {
+      await bot.stop();
+    } catch (error) {
+      logger.warn("telegram bot stop failed during shutdown", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     storage.close();
     process.exit(0);
   };
@@ -42,10 +62,14 @@ async function main(): Promise<void> {
     defaultSandboxMode: config.defaultSandboxMode,
     alwaysYoloMode: config.alwaysYoloMode,
   });
+  cronScheduler.start();
   await bot.start({
     drop_pending_updates: true,
     onStart: (info) => {
       logger.info("telegram bot started", { botUsername: info.username });
+      queueMicrotask(() => {
+        void resumeInterruptedRuns(bot, config, storage, claude, queue, interruptedRuns);
+      });
     },
   });
 }

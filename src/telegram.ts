@@ -6,10 +6,13 @@ import type { AppConfig } from "./config.js";
 import type {
   ClaudeBackend,
   ClaudeRunEvent,
+  CronJobRecord,
   InterruptedRunRecord,
   RunRecord,
   SandboxMode,
   TopicBinding,
+  WorkItemRecord,
+  WorkItemStatus,
 } from "./types.js";
 import { Storage } from "./storage.js";
 import { RunQueue } from "./runQueue.js";
@@ -19,6 +22,8 @@ import { commitAll, currentBranch, diffSummary, fullDiff, isGitRepository, pushH
 import { listClaudeModels, readClaudeUsage } from "./claudeMetadata.js";
 import { logger } from "./logger.js";
 import { TelegramSendQueue } from "./telegramSendQueue.js";
+import type { BridgeRequest, BridgeResult } from "./health.js";
+import { nextCronRunAfter, validateCronExpression } from "./cron.js";
 import {
   saveTelegramFileToContext,
   saveTranscriptForAudio,
@@ -34,6 +39,7 @@ interface TopicRef {
 
 interface SendOptions {
   notify?: boolean;
+  replyToMessageId?: number | null;
 }
 
 interface TelegramFileLike {
@@ -68,6 +74,7 @@ interface HandlePromptOptions {
 
 interface CreateTelegramBotOptions {
   recoverRuns?: InterruptedRunRecord[];
+  queue?: RunQueue;
 }
 
 const sendQueues = new WeakMap<AppConfig, TelegramSendQueue>();
@@ -79,7 +86,7 @@ export function createTelegramBot(
   options: CreateTelegramBotOptions = {},
 ): Bot {
   const bot = new Bot(config.telegramBotToken);
-  const queue = new RunQueue(config.maxParallelRuns);
+  const queue = options.queue ?? new RunQueue(config.maxParallelRuns);
   const sendQueue = sendQueueFor(config);
 
   bot.use(async (ctx, next) => {
@@ -134,6 +141,24 @@ export function createTelegramBot(
         sendQueue,
       );
       return;
+    }
+
+    const topic = getTopicRef(ctx, config);
+    const text = ctx.message && "text" in ctx.message
+      ? ctx.message.text
+      : ctx.message && "caption" in ctx.message
+        ? ctx.message.caption
+        : null;
+    if (topic && text) {
+      storage.addTopicMessage({
+        chatId: topic.chatId,
+        messageThreadId: topic.messageThreadId,
+        telegramMessageId: ctx.message?.message_id ?? null,
+        direction: "in",
+        authorId: fromId,
+        authorName: formatTelegramUser(ctx.from),
+        text,
+      });
     }
 
     await next();
@@ -630,6 +655,77 @@ export function createTelegramBot(
     await handlePrompt(ctx, config, storage, claude, bot, queue, text, { forceQueue: true });
   });
 
+  bot.command("dashboard", async (ctx) => {
+    const topic = getTopicRef(ctx, config);
+    if (!topic) {
+      await reply(ctx, "Use this inside a Telegram forum topic, or enable ALLOW_UNTHREADED_CHATS.", config);
+      return;
+    }
+    storage.audit({
+      telegramUserId: ctx.from?.id ?? null,
+      chatId: topic.chatId,
+      messageThreadId: topic.messageThreadId,
+      eventType: "manager_dashboard",
+      details: {},
+    });
+    await reply(ctx, managerDashboardText(storage, topic.chatId), config);
+  });
+
+  bot.command("topics", async (ctx) => {
+    const topic = getTopicRef(ctx, config);
+    if (!topic) {
+      await reply(ctx, "Use this inside a Telegram forum topic, or enable ALLOW_UNTHREADED_CHATS.", config);
+      return;
+    }
+    await reply(ctx, managerTopicsText(storage, topic.chatId), config);
+  });
+
+  bot.command("todo", async (ctx) => {
+    const topic = getTopicRef(ctx, config);
+    if (!topic) {
+      await reply(ctx, "Use this inside a Telegram forum topic, or enable ALLOW_UNTHREADED_CHATS.", config);
+      return;
+    }
+    await reply(ctx, managerTodoText(storage, topic.chatId), config);
+  });
+
+  bot.command("work", async (ctx) => {
+    const topic = getTopicRef(ctx, config);
+    if (!topic) {
+      await reply(ctx, "Use this inside a Telegram forum topic, or enable ALLOW_UNTHREADED_CHATS.", config);
+      return;
+    }
+    await reply(ctx, workItemsText(storage, topic.chatId, /^all$/i.test(ctx.match.trim())), config);
+  });
+
+  bot.command("work_add", async (ctx) => {
+    await handleWorkAddCommand(ctx, config, storage, ctx.match.trim());
+  });
+
+  bot.command("work_done", async (ctx) => {
+    await handleWorkStatusCommand(ctx, config, storage, ctx.match.trim(), "done");
+  });
+
+  bot.command("work_blocked", async (ctx) => {
+    await handleWorkStatusCommand(ctx, config, storage, ctx.match.trim(), "blocked");
+  });
+
+  bot.command("work_cancel", async (ctx) => {
+    await handleWorkStatusCommand(ctx, config, storage, ctx.match.trim(), "canceled");
+  });
+
+  bot.command("queue_topic", async (ctx) => {
+    await handleManagerQueueTopicCommand(ctx, config, storage, claude, bot, queue, ctx.match.trim());
+  });
+
+  bot.command("assign", async (ctx) => {
+    await handleManagerQueueTopicCommand(ctx, config, storage, claude, bot, queue, ctx.match.trim());
+  });
+
+  bot.command("cron", async (ctx) => {
+    await handleCronCommand(ctx, config, storage, ctx.match.trim());
+  });
+
   bot.on("message:file", async (ctx) => {
     await handleFileMessage(ctx, config, storage, claude, bot, queue);
   });
@@ -798,6 +894,881 @@ async function handleVoiceMessage(
   }
 }
 
+async function handleManagerQueueTopicCommand(
+  ctx: Context,
+  config: AppConfig,
+  storage: Storage,
+  claude: ClaudeBackend,
+  bot: Bot,
+  queue: RunQueue,
+  input: string,
+): Promise<void> {
+  const topic = getTopicRef(ctx, config);
+  if (!topic) {
+    await reply(ctx, "Use this inside a Telegram forum topic, or enable ALLOW_UNTHREADED_CHATS.", config);
+    return;
+  }
+
+  const result = await queueManagerTopicRun({
+    storage,
+    bot,
+    config,
+    claude,
+    queue,
+    managerTopic: topic,
+    telegramUserId: ctx.from?.id ?? null,
+    input,
+    replyToMessageId: null,
+  });
+  await reply(ctx, result.message, config);
+}
+
+export interface QueueManagerTopicRunInput {
+  storage: Storage;
+  bot: Bot;
+  config: AppConfig;
+  claude: ClaudeBackend;
+  queue: RunQueue;
+  managerTopic: TopicRef;
+  telegramUserId: number | null;
+  input: string;
+  replyToMessageId: number | null;
+  notify?: boolean;
+  source?: string;
+}
+
+export interface QueueManagerTopicRunResult {
+  ok: boolean;
+  message: string;
+  runId?: number;
+  topicId?: number;
+  topicName?: string;
+  repoPath?: string;
+  queuedBehind?: number;
+}
+
+export async function queueManagerTopicRun(input: QueueManagerTopicRunInput): Promise<QueueManagerTopicRunResult> {
+  const { storage, bot, config, claude, queue, managerTopic, telegramUserId } = input;
+  const request = parseManagerQueueTopicRequest(input.input);
+  if (!request) {
+    return { ok: false, message: "Usage: /queue_topic <topic-id-or-name> <prompt>" };
+  }
+
+  const binding = findManagerTargetBinding(storage, managerTopic.chatId, request.selector);
+  if (!binding) {
+    return {
+      ok: false,
+      message: [
+        `Could not find managed topic: ${request.selector}`,
+        "",
+        "Known topics:",
+        codeBlock(managerTopicSelectorList(storage, managerTopic.chatId)),
+      ].join("\n"),
+    };
+  }
+
+  const key = topicKey(binding.chatId, binding.messageThreadId);
+  const queuedBehind = queue.depth(key);
+  let run = storage.createRun(binding.id, null, request.prompt);
+  storage.audit({
+    telegramUserId,
+    chatId: managerTopic.chatId,
+    messageThreadId: managerTopic.messageThreadId,
+    eventType: "manager_queue_topic",
+    details: {
+      source: input.source ?? "manager",
+      targetMessageThreadId: binding.messageThreadId,
+      targetTopicName: topicDisplayName(binding),
+      runId: run.id,
+      queuedBehind,
+    },
+  });
+
+  const taskMessageId = await sendText(
+    bot,
+    config,
+    binding,
+    [
+      `Manager queued run #${run.id}.`,
+      "",
+      "Prompt:",
+      codeBlock(request.prompt),
+    ].join("\n"),
+    { notify: input.notify ?? true, replyToMessageId: input.replyToMessageId },
+  );
+  if (taskMessageId !== null) {
+    storage.updateRunTelegramMessageId(run.id, taskMessageId);
+    run = { ...run, telegramMessageId: taskMessageId };
+  }
+
+  queue.enqueue(key, async () => {
+    const freshBinding = storage.getBindingById(binding.id);
+    if (!freshBinding) {
+      storage.failRun(run.id, "topic binding was removed before the manager-queued run started");
+      return;
+    }
+    await executeRun(bot, config, storage, claude, { ...freshBinding, planMode: run.planMode }, run, request.prompt);
+  });
+
+  return {
+    ok: true,
+    message: [
+      `Queued run #${run.id} in ${topicDisplayName(binding)}.`,
+      `Topic: ${binding.messageThreadId}`,
+      queuedBehind > 0 ? `Behind ${queuedBehind} active/queued run(s).` : "It will start when a worker slot is available.",
+    ].join("\n"),
+    runId: run.id,
+    topicId: binding.messageThreadId,
+    topicName: topicDisplayName(binding),
+    repoPath: binding.repoPath,
+    queuedBehind,
+  };
+}
+
+interface CreateCronInput {
+  chatId: number;
+  currentMessageThreadId: number;
+  telegramUserId: number | null;
+  input: string;
+}
+
+interface CreateCronResult {
+  ok: boolean;
+  message: string;
+  cronId?: number;
+  topicId?: number;
+  topicName?: string;
+  repoPath?: string;
+  nextRunAt?: string;
+}
+
+async function handleCronCommand(
+  ctx: Context,
+  config: AppConfig,
+  storage: Storage,
+  input: string,
+): Promise<void> {
+  const topic = getTopicRef(ctx, config);
+  if (!topic) {
+    await reply(ctx, "Use this inside a Telegram forum topic, or enable ALLOW_UNTHREADED_CHATS.", config);
+    return;
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed || /^list$/i.test(trimmed)) {
+    await reply(ctx, cronListText(storage, topic.chatId), config);
+    return;
+  }
+
+  const offMatch = trimmed.match(/^(?:off|disable)\s+#?(\d+)\s*$/i);
+  if (offMatch) {
+    const cronId = Number.parseInt(offMatch[1] ?? "", 10);
+    const changed = storage.setCronJobEnabledForChat(topic.chatId, cronId, false);
+    await reply(ctx, changed ? `Disabled cron #${cronId}.` : `Could not find cron #${cronId}.`, config);
+    return;
+  }
+
+  const result = createCronForTopic(storage, {
+    chatId: topic.chatId,
+    currentMessageThreadId: topic.messageThreadId,
+    telegramUserId: ctx.from?.id ?? null,
+    input: trimmed,
+  });
+  await reply(ctx, result.message, config);
+}
+
+function createCronForTopic(storage: Storage, input: CreateCronInput): CreateCronResult {
+  const parsed = parseCronCommandInput(storage, input.chatId, input.currentMessageThreadId, input.input);
+  if (!parsed.ok) {
+    return { ok: false, message: parsed.message };
+  }
+
+  const nextRunAt = nextCronRunAfter(parsed.cronExpression, new Date()).toISOString();
+  const job = storage.createCronJob({
+    chatId: input.chatId,
+    bindingId: parsed.binding.id,
+    createdByUserId: input.telegramUserId,
+    cronExpression: parsed.cronExpression,
+    prompt: parsed.prompt,
+    nextRunAt,
+  });
+  storage.audit({
+    telegramUserId: input.telegramUserId,
+    chatId: input.chatId,
+    messageThreadId: input.currentMessageThreadId,
+    eventType: "cron_created",
+    details: {
+      cronId: job.id,
+      targetMessageThreadId: parsed.binding.messageThreadId,
+      cronExpression: parsed.cronExpression,
+      nextRunAt,
+    },
+  });
+
+  return {
+    ok: true,
+    message: [
+      `Created cron #${job.id} for ${topicDisplayName(parsed.binding)}.`,
+      `Schedule: ${codeBlock(parsed.cronExpression)}`,
+      `Next run: ${codeBlock(nextRunAt)}`,
+      "Prompt:",
+      codeBlock(parsed.prompt),
+    ].join("\n"),
+    cronId: job.id,
+    topicId: parsed.binding.messageThreadId,
+    topicName: topicDisplayName(parsed.binding),
+    repoPath: parsed.binding.repoPath,
+    nextRunAt,
+  };
+}
+
+type ParsedCronCommand =
+  | { ok: true; binding: TopicBinding; cronExpression: string; prompt: string }
+  | { ok: false; message: string };
+
+function parseCronCommandInput(
+  storage: Storage,
+  chatId: number,
+  currentMessageThreadId: number,
+  input: string,
+): ParsedCronCommand {
+  const tokens = input.trim().split(/\s+/);
+  if (tokens.length < 6) {
+    return {
+      ok: false,
+      message: [
+        "Usage:",
+        codeBlock([
+          "/cron <minute> <hour> <day> <month> <weekday> <prompt>",
+          "/cron <topic-id-or-name> <minute> <hour> <day> <month> <weekday> <prompt>",
+          "/cron list",
+          "/cron off <id>",
+        ].join("\n")),
+      ].join("\n"),
+    };
+  }
+
+  const currentBinding = storage.getBinding(chatId, currentMessageThreadId);
+  const currentTopicCron = parseCronAt(tokens, 0);
+  if (currentTopicCron && currentBinding) {
+    return { ok: true, binding: currentBinding, ...currentTopicCron };
+  }
+
+  const selector = tokens[0] ?? "";
+  const targetCron = parseCronAt(tokens, 1);
+  if (!targetCron) {
+    return { ok: false, message: "Could not parse cron expression. Use 5 fields like `0 * * * *`." };
+  }
+
+  const binding = findManagerTargetBinding(storage, chatId, selector);
+  if (!binding) {
+    return {
+      ok: false,
+      message: [
+        `Could not find managed topic: ${selector}`,
+        "",
+        "Known topics:",
+        codeBlock(managerTopicSelectorList(storage, chatId)),
+      ].join("\n"),
+    };
+  }
+  return { ok: true, binding, ...targetCron };
+}
+
+function parseCronAt(tokens: string[], offset: number): { cronExpression: string; prompt: string } | null {
+  if (tokens.length < offset + 6) {
+    return null;
+  }
+  const expression = tokens.slice(offset, offset + 5).join(" ");
+  let cronExpression: string;
+  try {
+    cronExpression = validateCronExpression(expression);
+  } catch {
+    return null;
+  }
+
+  const prompt = tokens.slice(offset + 5).join(" ").trim();
+  return prompt ? { cronExpression, prompt } : null;
+}
+
+function cronListText(storage: Storage, chatId: number): string {
+  const jobs = storage.listCronJobsForChat(chatId);
+  if (jobs.length === 0) {
+    return "No cron jobs in this chat yet.";
+  }
+
+  return [
+    "Cron jobs:",
+    codeBlock(
+      jobs
+        .map((job) => {
+          const binding = storage.getBindingById(job.bindingId);
+          const target = binding ? `${topicDisplayName(binding)} (#${binding.messageThreadId})` : `removed binding ${job.bindingId}`;
+          return [
+            `#${job.id} ${job.enabled ? "enabled" : "disabled"} ${job.cronExpression}`,
+            `  target: ${target}`,
+            `  next: ${job.nextRunAt}`,
+            `  runs: ${job.runCount}${job.lastRunId ? `, last run #${job.lastRunId}` : ""}`,
+            job.lastError ? `  last error: ${job.lastError}` : null,
+            `  prompt: ${truncateText(job.prompt, 140)}`,
+          ]
+            .filter(Boolean)
+            .join("\n");
+        })
+        .join("\n\n"),
+    ),
+  ].join("\n");
+}
+
+async function handleWorkAddCommand(ctx: Context, config: AppConfig, storage: Storage, input: string): Promise<void> {
+  const topic = getTopicRef(ctx, config);
+  if (!topic) {
+    await reply(ctx, "Use this inside a Telegram forum topic, or enable ALLOW_UNTHREADED_CHATS.", config);
+    return;
+  }
+
+  const result = createWorkItemForTopic(storage, {
+    chatId: topic.chatId,
+    currentMessageThreadId: topic.messageThreadId,
+    telegramUserId: ctx.from?.id ?? null,
+    input,
+  });
+  await reply(ctx, result.message, config);
+}
+
+async function handleWorkStatusCommand(
+  ctx: Context,
+  config: AppConfig,
+  storage: Storage,
+  input: string,
+  status: WorkItemStatus,
+): Promise<void> {
+  const topic = getTopicRef(ctx, config);
+  if (!topic) {
+    await reply(ctx, "Use this inside a Telegram forum topic, or enable ALLOW_UNTHREADED_CHATS.", config);
+    return;
+  }
+
+  const parsed = parseWorkItemIdAndText(input);
+  if (!parsed) {
+    const command = status === "canceled" ? "cancel" : status === "done" ? "done" : status;
+    await reply(ctx, `Usage: /work_${command} <id> <note>`, config);
+    return;
+  }
+
+  const item = storage.updateWorkItemForChat(topic.chatId, parsed.workItemId, {
+    status,
+    evidence: parsed.text || null,
+  });
+  if (!item) {
+    await reply(ctx, `Could not find work item #${parsed.workItemId}.`, config);
+    return;
+  }
+
+  storage.audit({
+    telegramUserId: ctx.from?.id ?? null,
+    chatId: topic.chatId,
+    messageThreadId: topic.messageThreadId,
+    eventType: "work_item_status",
+    details: { workItemId: item.id, status, evidence: parsed.text || null },
+  });
+  await reply(ctx, `Updated work item #${item.id} to ${item.status}.`, config);
+}
+
+interface CreateWorkItemInput {
+  chatId: number;
+  currentMessageThreadId: number;
+  telegramUserId: number | null;
+  input: string;
+  selector?: string;
+  title?: string;
+  detail?: string | null;
+  priority?: string | null;
+  dueAt?: string | null;
+}
+
+interface CreateWorkItemResult {
+  ok: boolean;
+  message: string;
+  workItemId?: number;
+  topicId?: number;
+  topicName?: string;
+  repoPath?: string;
+  workItem?: WorkItemRecord;
+}
+
+function createWorkItemForTopic(storage: Storage, input: CreateWorkItemInput): CreateWorkItemResult {
+  const parsed = parseWorkAddInput(storage, input.chatId, input.currentMessageThreadId, input.input, input.selector, input.title);
+  if (!parsed.ok) {
+    return { ok: false, message: parsed.message };
+  }
+
+  const item = storage.createWorkItem({
+    chatId: input.chatId,
+    bindingId: parsed.binding.id,
+    createdByUserId: input.telegramUserId,
+    title: parsed.title,
+    detail: input.detail ?? null,
+    priority: input.priority ?? null,
+    dueAt: input.dueAt ?? null,
+  });
+  storage.audit({
+    telegramUserId: input.telegramUserId,
+    chatId: input.chatId,
+    messageThreadId: input.currentMessageThreadId,
+    eventType: "work_item_created",
+    details: {
+      workItemId: item.id,
+      targetMessageThreadId: parsed.binding.messageThreadId,
+      title: parsed.title,
+    },
+  });
+
+  return {
+    ok: true,
+    message: [
+      `Created work item #${item.id} for ${topicDisplayName(parsed.binding)}.`,
+      `Status: ${item.status}`,
+      `Title: ${item.title}`,
+    ].join("\n"),
+    workItemId: item.id,
+    topicId: parsed.binding.messageThreadId,
+    topicName: topicDisplayName(parsed.binding),
+    repoPath: parsed.binding.repoPath,
+    workItem: item,
+  };
+}
+
+type ParsedWorkAddInput =
+  | { ok: true; binding: TopicBinding; title: string }
+  | { ok: false; message: string };
+
+function parseWorkAddInput(
+  storage: Storage,
+  chatId: number,
+  currentMessageThreadId: number,
+  input: string,
+  explicitSelector?: string,
+  explicitTitle?: string,
+): ParsedWorkAddInput {
+  if (explicitSelector || explicitTitle) {
+    const selector = explicitSelector?.trim() ?? "";
+    const title = explicitTitle?.trim() ?? "";
+    if (!selector || !title) {
+      return { ok: false, message: "create_work_item requires topic and title." };
+    }
+    const binding = findManagerTargetBinding(storage, chatId, selector);
+    return binding
+      ? { ok: true, binding, title }
+      : { ok: false, message: `Could not find managed topic: ${selector}` };
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      message: [
+        "Usage:",
+        codeBlock(["/work_add <title>", "/work_add <topic-id-or-name> <title>"].join("\n")),
+      ].join("\n"),
+    };
+  }
+
+  const currentBinding = storage.getBinding(chatId, currentMessageThreadId);
+  const routed = parseManagerQueueTopicRequest(trimmed);
+  if (routed) {
+    const target = findManagerTargetBinding(storage, chatId, routed.selector);
+    if (target) {
+      return { ok: true, binding: target, title: routed.prompt };
+    }
+  }
+
+  if (currentBinding) {
+    return { ok: true, binding: currentBinding, title: trimmed };
+  }
+
+  return { ok: false, message: "Use /work_add inside a bound topic or provide a topic selector." };
+}
+
+function parseWorkItemIdAndText(input: string): { workItemId: number; text: string } | null {
+  const match = input.trim().match(/^#?(\d+)(?:\s+([\s\S]+))?$/);
+  if (!match) {
+    return null;
+  }
+  const workItemId = Number.parseInt(match[1] ?? "", 10);
+  return Number.isSafeInteger(workItemId) ? { workItemId, text: (match[2] ?? "").trim() } : null;
+}
+
+export async function handleTelegramBridgeRequest(input: {
+  storage: Storage;
+  bot: Bot;
+  config: AppConfig;
+  claude: ClaudeBackend;
+  queue: RunQueue;
+  request: BridgeRequest;
+}): Promise<BridgeResult> {
+  const { storage, bot, config, claude, queue, request } = input;
+
+  if (request.action === "list_topics") {
+    const topics = storage.listBindingsForChat(request.chatId).map((binding) => {
+      const active = storage.getActiveRun(binding.id);
+      const latest = storage.getLatestRun(binding.id);
+      return {
+        topicId: binding.messageThreadId,
+        topicName: topicDisplayName(binding),
+        repoPath: binding.repoPath,
+        status: binding.status,
+        activeRunId: active?.id ?? null,
+        latestRunId: latest?.id ?? null,
+        latestRunStatus: latest?.status ?? null,
+      };
+    });
+    return {
+      ok: true,
+      message: topics.length > 0 ? `Found ${topics.length} bound topic(s).` : "No bound topics found.",
+      topics,
+    };
+  }
+
+  if (request.action === "list_crons") {
+    const crons = storage.listCronJobsForChat(request.chatId).map((job) => {
+      const binding = storage.getBindingById(job.bindingId);
+      return {
+        cronId: job.id,
+        enabled: job.enabled,
+        cron: job.cronExpression,
+        prompt: job.prompt,
+        nextRunAt: job.nextRunAt,
+        lastRunAt: job.lastRunAt,
+        lastRunId: job.lastRunId,
+        lastError: job.lastError,
+        runCount: job.runCount,
+        topicId: binding?.messageThreadId ?? null,
+        topicName: binding ? topicDisplayName(binding) : null,
+        repoPath: binding?.repoPath ?? null,
+      };
+    });
+    return {
+      ok: true,
+      message: crons.length > 0 ? `Found ${crons.length} cron job(s).` : "No cron jobs found.",
+      crons,
+    };
+  }
+
+  if (request.action === "delete_cron") {
+    if (!request.cronId) {
+      return { ok: false, message: "delete_cron requires cronId." };
+    }
+    const changed = storage.setCronJobEnabledForChat(request.chatId, request.cronId, false);
+    return {
+      ok: changed,
+      message: changed ? `Disabled cron #${request.cronId}.` : `Could not find cron #${request.cronId}.`,
+    };
+  }
+
+  if (request.action === "list_work_items") {
+    const workItems = storage.listWorkItemsForChat(request.chatId, {
+      includeClosed: request.includeClosed ?? false,
+      limit: request.limit ?? 50,
+    });
+    return {
+      ok: true,
+      message: workItems.length > 0 ? `Found ${workItems.length} work item(s).` : "No work items found.",
+      workItems: workItems.map((item) => formatWorkItemForBridge(storage, item)),
+    };
+  }
+
+  if (request.action === "create_work_item") {
+    const selector = request.selector?.trim() ?? "";
+    const title = request.title?.trim() ?? "";
+    if (!selector || !title) {
+      return { ok: false, message: "create_work_item requires topic and title." };
+    }
+    return createWorkItemForTopic(storage, {
+      chatId: request.chatId,
+      currentMessageThreadId: 0,
+      telegramUserId: null,
+      input: "",
+      selector,
+      title,
+      detail: request.detail?.trim() || null,
+      priority: request.priority?.trim() || null,
+      dueAt: request.dueAt?.trim() || null,
+    });
+  }
+
+  if (request.action === "update_work_item" || request.action === "complete_work_item") {
+    if (!request.workItemId) {
+      return { ok: false, message: `${request.action} requires workItemId.` };
+    }
+    const status: WorkItemStatus | undefined =
+      request.action === "complete_work_item"
+        ? "done"
+        : request.status
+          ? normalizeWorkItemStatus(request.status) ?? undefined
+          : undefined;
+    if (request.status && !status) {
+      return { ok: false, message: "status must be one of open, in_progress, blocked, done, canceled." };
+    }
+    const update: {
+      status?: WorkItemStatus;
+      detail?: string | null;
+      priority?: string;
+      evidence?: string | null;
+      dueAt?: string | null;
+    } = {};
+    if (status) {
+      update.status = status;
+    }
+    if (request.detail !== undefined) {
+      update.detail = request.detail;
+    }
+    if (request.priority !== undefined) {
+      update.priority = request.priority;
+    }
+    if (request.evidence !== undefined) {
+      update.evidence = request.evidence;
+    }
+    if (request.dueAt !== undefined) {
+      update.dueAt = request.dueAt;
+    }
+    const item = storage.updateWorkItemForChat(request.chatId, request.workItemId, update);
+    if (!item) {
+      return { ok: false, message: `Could not find work item #${request.workItemId}.` };
+    }
+    return {
+      ok: true,
+      message: `Updated work item #${item.id} to ${item.status}.`,
+      workItemId: item.id,
+      workItem: formatWorkItemForBridge(storage, item),
+    };
+  }
+
+  if (request.action === "create_cron") {
+    const selector = request.selector?.trim() ?? "";
+    const cron = request.cron?.trim() ?? "";
+    const prompt = request.prompt?.trim() ?? "";
+    if (!selector || !cron || !prompt) {
+      return { ok: false, message: "create_cron requires topic, cron, and prompt." };
+    }
+    return createCronForTopic(storage, {
+      chatId: request.chatId,
+      currentMessageThreadId: 0,
+      telegramUserId: null,
+      input: `${selector} ${cron} ${prompt}`,
+    });
+  }
+
+  if (request.action === "read_topic_messages") {
+    const selector = request.selector?.trim() ?? "";
+    if (!selector) {
+      return { ok: false, message: "read_topic_messages requires a topic selector." };
+    }
+    const binding = findManagerTargetBinding(storage, request.chatId, selector);
+    if (!binding) {
+      return { ok: false, message: `Could not find topic: ${selector}` };
+    }
+
+    const messages = storage.listTopicMessages(request.chatId, binding.messageThreadId, request.limit ?? 25);
+    return {
+      ok: true,
+      message:
+        messages.length > 0
+          ? `Found ${messages.length} stored message(s) for ${topicDisplayName(binding)}.`
+          : `No stored messages for ${topicDisplayName(binding)} yet. Only messages observed after this feature was deployed are available.`,
+      topicId: binding.messageThreadId,
+      topicName: topicDisplayName(binding),
+      repoPath: binding.repoPath,
+      messages,
+    };
+  }
+
+  if (request.action === "create_topic") {
+    const requestedFolder = request.selector?.trim() ?? "";
+    if (!requestedFolder) {
+      return { ok: false, message: "create_topic requires a folder name or path." };
+    }
+
+    try {
+      const repoPath = resolveNewWorkspacePath(requestedFolder, config.allowedRepoRoots);
+      const topicName = topicNameForPath(repoPath);
+      const directoryState = await ensureWorkspaceDirectory(repoPath);
+      const createdTopic = await bot.api.createForumTopic(request.chatId, topicName);
+      const binding = storage.upsertBinding({
+        chatId: request.chatId,
+        messageThreadId: createdTopic.message_thread_id,
+        topicName,
+        repoPath,
+        createdByUserId: 0,
+        sandboxMode: effectiveSandboxMode(config, config.defaultSandboxMode),
+      });
+      storage.audit({
+        telegramUserId: null,
+        chatId: request.chatId,
+        messageThreadId: createdTopic.message_thread_id,
+        eventType: "bridge_create_topic",
+        details: { repoPath, topicName, directoryState },
+      });
+      await sendText(bot, config, binding, [`Created topic for:`, codeBlock(repoPath)].join("\n"), {
+        notify: false,
+      });
+      return {
+        ok: true,
+        message: `${directoryState === "existed" ? "Reused existing folder and c" : "C"}reated topic ${topicName} (#${createdTopic.message_thread_id}).`,
+        topicId: createdTopic.message_thread_id,
+        topicName,
+        repoPath,
+      };
+    } catch (error) {
+      return { ok: false, message: errorMessage(error) };
+    }
+  }
+
+  const selector = request.selector?.trim() ?? "";
+  const prompt = request.prompt?.trim() ?? "";
+  if (!selector || !prompt) {
+    return { ok: false, message: "queue_topic requires topic and prompt." };
+  }
+
+  return queueManagerTopicRun({
+    storage,
+    bot,
+    config,
+    claude,
+    queue,
+    managerTopic: { chatId: request.chatId, messageThreadId: 0 },
+    telegramUserId: null,
+    input: `${selector} ${prompt}`,
+    replyToMessageId: null,
+  });
+}
+
+interface ManagerQueueTopicRequest {
+  selector: string;
+  prompt: string;
+}
+
+function parseQueueTopicAlias(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const idAlias = trimmed.match(/^#\s*([0-9]+)\s*[:\-]?\s*([\s\S]+)$/);
+  if (idAlias) {
+    const selector = idAlias[1] ?? "";
+    const prompt = (idAlias[2] ?? "").trim();
+    return prompt ? `${selector} ${prompt}` : null;
+  }
+
+  const quotedAlias = trimmed.match(/^(?:topic|to)\s+"([^"]+)"\s*[:\-]?\s*([\s\S]+)$/i);
+  if (quotedAlias) {
+    const selector = (quotedAlias[1] ?? "").trim();
+    const prompt = (quotedAlias[2] ?? "").trim();
+    return prompt ? `"${selector}" ${prompt}` : null;
+  }
+
+  const simpleAlias = trimmed.match(/^(?:topic|to)\s+([A-Za-z0-9._-]+)\s*[:\-]?\s*([\s\S]+)$/i);
+  if (simpleAlias) {
+    const selector = (simpleAlias[1] ?? "").trim();
+    const prompt = (simpleAlias[2] ?? "").trim();
+    return prompt ? `${selector} ${prompt}` : null;
+  }
+
+  return null;
+}
+
+function parseManagerQueueTopicRequest(input: string): ManagerQueueTopicRequest | null {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const quoted = trimmed.match(/^"([^"]+)"\s+([\s\S]+)\s*$/);
+  if (quoted) {
+    const selector = (quoted[1] ?? "").trim();
+    const prompt = (quoted[2] ?? "").trim();
+    return prompt ? { selector, prompt } : null;
+  }
+
+  const split = trimmed.match(/^(\S+)\s+([\s\S]+)\s*$/);
+  if (!split) {
+    return null;
+  }
+
+  const selector = (split[1] ?? "").trim();
+  const prompt = (split[2] ?? "").trim();
+  if (!selector || !prompt) {
+    return null;
+  }
+
+  return { selector, prompt };
+}
+
+function parseEmbeddedManagerQueueCommand(text: string): string | null {
+  const match = text.match(/(?:^|\s)\/(assign|queue_topic)\s+([\s\S]+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  const extracted = (match[2] ?? "").trim();
+  return extracted.length > 0 ? extracted : null;
+}
+
+function findManagerTargetBinding(storage: Storage, chatId: number, selector: string): TopicBinding | null {
+  const bindings = storage.listBindingsForChat(chatId);
+  if (bindings.length === 0) {
+    return null;
+  }
+
+  const normalizedSelector = selector.trim().toLowerCase();
+  const numericMatch = normalizedSelector.match(/^\s*#?(\d+)\s*$/);
+  if (numericMatch) {
+    const targetThreadId = Number.parseInt(numericMatch[1] ?? "", 10);
+    return bindings.find((binding) => binding.messageThreadId === targetThreadId) ?? null;
+  }
+
+  const topicNameMatch = bindings.find((binding) =>
+    topicDisplayName(binding).toLowerCase() === normalizedSelector,
+  );
+  if (topicNameMatch) {
+    return topicNameMatch;
+  }
+
+  const repoNameMatch = bindings.find((binding) =>
+    path.basename(binding.repoPath).toLowerCase() === normalizedSelector,
+  );
+  if (repoNameMatch) {
+    return repoNameMatch;
+  }
+
+  const startsWithMatches = bindings.filter(
+    (binding) =>
+      topicDisplayName(binding).toLowerCase().startsWith(normalizedSelector) ||
+      path.basename(binding.repoPath).toLowerCase().startsWith(normalizedSelector),
+  );
+  if (startsWithMatches.length === 1) {
+    return startsWithMatches[0] ?? null;
+  }
+
+  return null;
+}
+
+function managerTopicSelectorList(storage: Storage, chatId: number): string {
+  const bindings = storage.listBindingsForChat(chatId);
+  if (bindings.length === 0) {
+    return "No worker topics are currently bound.";
+  }
+
+  return bindings
+    .map(
+      (binding) =>
+        `#${binding.messageThreadId}: ${topicDisplayName(binding)} (${path.basename(binding.repoPath)})`,
+    )
+    .join("\n");
+}
+
+
 async function handlePrompt(
   ctx: Context,
   config: AppConfig,
@@ -863,7 +1834,7 @@ async function handlePrompt(
   });
 }
 
-async function resumeInterruptedRuns(
+export async function resumeInterruptedRuns(
   bot: Bot,
   config: AppConfig,
   storage: Storage,
@@ -1266,16 +2237,20 @@ async function sendText(
   binding: TopicBinding,
   text: string,
   options: SendOptions = {},
-): Promise<void> {
+): Promise<number | null> {
   const chunks = markdownV2Chunks(text, config.maxTelegramMessageChars);
+  let firstMessageId: number | null = null;
   for (const [index, chunk] of chunks.entries()) {
-    await sendQueueFor(config).sendMessage(bot.api, binding.chatId, chunk, {
+    const message = await sendQueueFor(config).sendMessage(bot.api, binding.chatId, chunk, {
       message_thread_id: binding.messageThreadId,
       link_preview_options: { is_disabled: true },
       parse_mode: "MarkdownV2",
       disable_notification: !(options.notify === true && index === 0),
+      ...(options.replyToMessageId ? { reply_parameters: { message_id: options.replyToMessageId } } : {}),
     });
+    firstMessageId ??= message.message_id;
   }
+  return firstMessageId;
 }
 
 async function sendChatAction(bot: Bot, binding: TopicBinding): Promise<void> {
@@ -1454,6 +2429,165 @@ function voiceTranscriptPrompt(transcript: string): string {
   ].join("\n");
 }
 
+function managerDashboardText(storage: Storage, chatId: number): string {
+  const bindings = storage.listBindingsForChat(chatId);
+  const actionable = storage.listActionableRunsForChat(chatId, 12);
+  const workItems = storage.listWorkItemsForChat(chatId, { limit: 12 });
+  const running = actionable.filter((item) => item.run.status === "running").length;
+  const queued = actionable.filter((item) => item.run.status === "queued").length;
+  const failed = actionable.filter((item) => item.run.status === "failed").length;
+
+  return [
+    "Topic dashboard",
+    "",
+    "Summary:",
+    codeBlock(
+      [
+        `bound topics: ${bindings.length}`,
+        `running: ${running}`,
+        `queued: ${queued}`,
+        `failed needing review: ${failed}`,
+        `open work items: ${workItems.length}`,
+      ].join("\n"),
+    ),
+    "Work items:",
+    workItems.length > 0
+      ? codeBlock(workItems.map((item) => formatWorkItemLine(storage, item)).join("\n"))
+      : codeBlock("none"),
+    "",
+    "Active work:",
+    actionable.length > 0
+      ? codeBlock(actionable.map(({ binding, run }) => formatManagerRunLine(binding, run)).join("\n"))
+      : codeBlock("none"),
+    "",
+    "Use /topics for all bindings and /todo for actionable runs.",
+  ].join("\n");
+}
+
+function managerTopicsText(storage: Storage, chatId: number): string {
+  const bindings = storage.listBindingsForChat(chatId);
+  if (bindings.length === 0) {
+    return "No bound topics in this chat yet. Use /create to create a new topic or /bind inside an existing topic.";
+  }
+
+  return [
+    "Managed topics:",
+    codeBlock(
+      bindings
+        .map((binding) => {
+          const active = storage.getActiveRun(binding.id);
+          const latest = storage.getLatestRun(binding.id);
+          const runLabel = active
+            ? `active #${active.id} ${active.status}`
+            : latest
+              ? `latest #${latest.id} ${latest.status}`
+              : "no runs";
+          return [
+            `topic ${binding.messageThreadId}: ${topicDisplayName(binding)}`,
+            `  status: ${binding.status}; ${runLabel}`,
+            `  repo: ${binding.repoPath}`,
+          ].join("\n");
+        })
+        .join("\n\n"),
+    ),
+  ].join("\n");
+}
+
+function managerTodoText(storage: Storage, chatId: number): string {
+  const workItems = storage.listWorkItemsForChat(chatId, { limit: 30 });
+  const actionable = storage.listActionableRunsForChat(chatId, 20);
+  if (workItems.length === 0 && actionable.length === 0) {
+    return [
+      "Topic todo:",
+      codeBlock("No open work items, queued runs, running runs, or failed runs found."),
+    ].join("\n");
+  }
+
+  const grouped = [
+    ["Running", actionable.filter((item) => item.run.status === "running")],
+    ["Queued", actionable.filter((item) => item.run.status === "queued")],
+    ["Needs review", actionable.filter((item) => item.run.status === "failed")],
+  ] as const;
+
+  return [
+    "Topic todo:",
+    workItems.length > 0
+      ? ["", "Work items:", codeBlock(workItems.map((item) => formatWorkItemLine(storage, item)).join("\n"))].join("\n")
+      : "",
+    ...grouped.flatMap(([label, items]) =>
+      items.length > 0
+        ? [
+            "",
+            `${label}:`,
+            codeBlock(items.map(({ binding, run }) => formatManagerRunLine(binding, run)).join("\n")),
+          ]
+        : [],
+    ),
+  ].join("\n");
+}
+
+function workItemsText(storage: Storage, chatId: number, includeClosed: boolean): string {
+  const workItems = storage.listWorkItemsForChat(chatId, { includeClosed, limit: 50 });
+  if (workItems.length === 0) {
+    return includeClosed ? "No work items in this chat yet." : "No open work items in this chat yet.";
+  }
+  return [
+    includeClosed ? "Work items:" : "Open work items:",
+    codeBlock(workItems.map((item) => formatWorkItemLine(storage, item)).join("\n")),
+  ].join("\n");
+}
+
+function formatWorkItemLine(storage: Storage, item: WorkItemRecord): string {
+  const binding = item.bindingId ? storage.getBindingById(item.bindingId) : null;
+  const target = binding ? topicDisplayName(binding) : "unassigned";
+  const due = item.dueAt ? ` due:${item.dueAt}` : "";
+  const evidence = item.evidence ? ` - ${oneLine(item.evidence, 70)}` : "";
+  return `#${item.id} ${item.status.padEnd(11)} ${item.priority.padEnd(7)} ${target}${due} - ${oneLine(item.title, 90)}${evidence}`;
+}
+
+function formatWorkItemForBridge(storage: Storage, item: WorkItemRecord): Record<string, unknown> {
+  const binding = item.bindingId ? storage.getBindingById(item.bindingId) : null;
+  return {
+    workItemId: item.id,
+    status: item.status,
+    priority: item.priority,
+    title: item.title,
+    detail: item.detail,
+    evidence: item.evidence,
+    dueAt: item.dueAt,
+    completedAt: item.completedAt,
+    updatedAt: item.updatedAt,
+    topicId: binding?.messageThreadId ?? null,
+    topicName: binding ? topicDisplayName(binding) : null,
+    repoPath: binding?.repoPath ?? null,
+    lastRunId: item.lastRunId,
+  };
+}
+
+function normalizeWorkItemStatus(value: string): WorkItemStatus | null {
+  const normalized = value.trim().toLowerCase().replace(/-/g, "_");
+  return normalized === "open" ||
+    normalized === "in_progress" ||
+    normalized === "blocked" ||
+    normalized === "done" ||
+    normalized === "canceled"
+    ? normalized
+    : null;
+}
+
+function formatManagerRunLine(binding: TopicBinding, run: RunRecord): string {
+  return `#${run.id} ${run.status.padEnd(9)} ${topicDisplayName(binding)} - ${oneLine(run.prompt, 90)}`;
+}
+
+function topicDisplayName(binding: TopicBinding): string {
+  return binding.topicName || path.basename(binding.repoPath) || `topic ${binding.messageThreadId}`;
+}
+
+function oneLine(value: string, maxLength: number): string {
+  return truncateText(value.replace(/\s+/g, " ").trim(), maxLength);
+}
+
+
 async function modelLabel(config: AppConfig, binding: TopicBinding): Promise<string> {
   if (binding.model) {
     return `${binding.model} (topic)`;
@@ -1598,6 +2732,16 @@ function helpText(): string {
     "/mode write - allow Claude workspace edits",
     "/topic - rename this Telegram topic to the bound folder name",
     "/new - start a fresh Claude session",
+    "/dashboard - show all topic activity",
+    "/topics - list all bound topics",
+    "/todo - show open work items plus running, queued, and failed runs",
+    "/work - list open work items",
+    "/work all - list open and closed work items",
+    "/work_add <title> - create a work item for this topic",
+    "/work_add <topic-id-or-name> <title> - create a work item for another topic",
+    "/work_done <id> <evidence> - mark a work item done",
+    "/work_blocked <id> <reason> - mark a work item blocked",
+    "/work_cancel <id> <reason> - cancel a work item",
     "/status - show active queued/running task",
     "/stop - stop the active Claude process",
     "/diff - show diff summary and attach full diff when large",
@@ -1606,6 +2750,12 @@ function helpText(): string {
     "/unbind - remove this topic binding",
     "/ask <prompt> - send a Claude prompt as a command",
     "/queue <prompt> - queue the next Claude turn instead of steering the active run",
+    "/queue_topic <topic-id-or-name> <prompt> - queue prompt for a worker topic",
+    "/assign <topic-id-or-name> <prompt> - alias for /queue_topic",
+    "/cron <5-field-cron> <prompt> - schedule a recurring prompt for this topic",
+    "/cron <topic-id-or-name> <5-field-cron> <prompt> - schedule another topic",
+    "/cron list - list scheduled prompts in this chat",
+    "/cron off <id> - disable a scheduled prompt",
     "",
     "Any ordinary message in a bound topic is sent to Claude if Telegram privacy mode allows it. Use /queue to force a follow-up turn, or /ask when privacy mode is enabled.",
   ].join("\n");
@@ -1622,6 +2772,14 @@ export function telegramCommandMenu(): Array<{ command: string; description: str
     { command: "mode", description: "Set read or write sandbox mode" },
     { command: "topic", description: "Rename this Telegram topic" },
     { command: "new", description: "Start a fresh Claude session" },
+    { command: "dashboard", description: "Show topic activity" },
+    { command: "topics", description: "List managed topic bindings" },
+    { command: "todo", description: "Show work items and run state" },
+    { command: "work", description: "List work items" },
+    { command: "work_add", description: "Create a work item" },
+    { command: "work_done", description: "Mark work item done" },
+    { command: "work_blocked", description: "Mark work item blocked" },
+    { command: "work_cancel", description: "Cancel a work item" },
     { command: "status", description: "Show active queued or running task" },
     { command: "stop", description: "Stop the active Claude process" },
     { command: "diff", description: "Show git diff summary" },
@@ -1630,6 +2788,9 @@ export function telegramCommandMenu(): Array<{ command: string; description: str
     { command: "unbind", description: "Remove this topic binding" },
     { command: "ask", description: "Send a Claude prompt as a command" },
     { command: "queue", description: "Queue the next Claude turn" },
+    { command: "queue_topic", description: "Queue a prompt for a worker topic" },
+    { command: "assign", description: "Alias for /queue_topic" },
+    { command: "cron", description: "Create or list scheduled prompts" },
   ];
 }
 
@@ -1639,6 +2800,18 @@ function errorMessage(error: unknown): string {
     return [error.message, maybe.stderr, maybe.stdout].filter(Boolean).join("\n");
   }
   return String(error);
+}
+
+function formatTelegramUser(user: Context["from"]): string {
+  if (!user) {
+    return "unknown";
+  }
+  const parts = [
+    user.username ? `@${user.username}` : null,
+    [user.first_name, user.last_name].filter(Boolean).join(" ") || null,
+    String(user.id),
+  ].filter(Boolean);
+  return parts.join(" / ");
 }
 
 function resolveNewWorkspacePath(requestedFolder: string, allowedRoots: string[]): string {

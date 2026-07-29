@@ -1,0 +1,22 @@
+[Unit]
+Description=Back up Claude Telegram fleet state
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=gnu
+Group=gnu
+WorkingDirectory=/home/gnu/claude-cli-over-telegram
+Environment=HOME=/home/gnu
+Environment=PATH=/home/gnu/.local/bin:/home/gnu/.grok/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=APP_DIR=/home/gnu/claude-cli-over-telegram
+Environment=MANAGER_REPO=/home/gnu/claude-manager
+Environment=DATABASE_PATH=/home/gnu/.local/state/claude-cli-over-telegram/state.sqlite
+Environment=COMMIT_FLEET_BACKUP=false
+Environment=PUSH_FLEET_BACKUP=false
+ExecStart=/home/gnu/claude-cli-over-telegram/scripts/backup-fleet-state.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/gnu/claude-cli-over-telegram /home/gnu/claude-manager

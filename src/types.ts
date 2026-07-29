@@ -24,6 +24,7 @@ export interface RunRecord {
   bindingId: number;
   telegramMessageId: number | null;
   prompt: string;
+  planMode: boolean;
   status: RunStatus;
   claudeRunId: string | null;
   startedAt: string | null;
@@ -31,6 +32,42 @@ export interface RunRecord {
   exitCode: number | null;
   finalMessage: string | null;
   errorMessage: string | null;
+}
+
+export interface CronJobRecord {
+  id: number;
+  chatId: number;
+  bindingId: number;
+  createdByUserId: number | null;
+  cronExpression: string;
+  prompt: string;
+  enabled: boolean;
+  nextRunAt: string;
+  lastRunAt: string | null;
+  lastRunId: number | null;
+  lastError: string | null;
+  runCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type WorkItemStatus = "open" | "in_progress" | "blocked" | "done" | "canceled";
+
+export interface WorkItemRecord {
+  id: number;
+  chatId: number;
+  bindingId: number | null;
+  createdByUserId: number | null;
+  title: string;
+  detail: string | null;
+  status: WorkItemStatus;
+  priority: string;
+  evidence: string | null;
+  lastRunId: number | null;
+  dueAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
 }
 
 export interface InterruptedRunRecord extends RunRecord {

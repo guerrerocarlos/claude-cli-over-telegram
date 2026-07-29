@@ -1,4 +1,6 @@
 import "dotenv/config";
+import { randomBytes } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 import { mkdirSync } from "node:fs";
 import type { SandboxMode } from "./types.js";
@@ -22,9 +24,21 @@ export interface AppConfig {
   healthHost: string;
   healthPort: number;
   allowUnthreadedChats: boolean;
+  managerRepoPath: string;
+  managerBridgeToken: string;
   deployBranch: string;
   deployCommitHash: string;
   deployedAt: string;
+}
+
+function expandHome(input: string): string {
+  if (input === "~") {
+    return os.homedir();
+  }
+  if (input.startsWith("~/")) {
+    return path.join(os.homedir(), input.slice(2));
+  }
+  return input;
 }
 
 function required(name: string): string {
@@ -106,7 +120,10 @@ function parseBoolean(name: string, fallback: boolean): boolean {
 
 export function loadConfig(): AppConfig {
   const databasePath = path.resolve(optional("DATABASE_PATH", "./data/state.sqlite"));
+  const managerRepoPath = path.resolve(expandHome(optional("MANAGER_REPO_PATH", "~/claude-manager")));
+  const managerBridgeToken = optional("MANAGER_BRIDGE_TOKEN", randomBytes(32).toString("hex"));
   mkdirSync(path.dirname(databasePath), { recursive: true });
+  mkdirSync(managerRepoPath, { recursive: true });
 
   return {
     telegramBotToken: required("TELEGRAM_BOT_TOKEN"),
@@ -127,6 +144,8 @@ export function loadConfig(): AppConfig {
     healthHost: optional("HEALTH_HOST", "127.0.0.1"),
     healthPort: parseInteger("HEALTH_PORT", 8787),
     allowUnthreadedChats: parseBoolean("ALLOW_UNTHREADED_CHATS", false),
+    managerRepoPath,
+    managerBridgeToken,
     deployBranch: optional("DEPLOY_BRANCH", "unknown"),
     deployCommitHash: optional("DEPLOY_COMMIT_HASH", "unknown"),
     deployedAt: optional("DEPLOYED_AT", "unknown"),

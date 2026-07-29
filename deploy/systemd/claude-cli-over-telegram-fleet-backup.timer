@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Claude Telegram fleet state backup
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+Unit=claude-cli-over-telegram-fleet-backup.service
+
+[Install]
+WantedBy=timers.target

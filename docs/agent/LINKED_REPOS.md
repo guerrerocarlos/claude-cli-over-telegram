@@ -18,3 +18,5 @@ Boundaries:
 - Claude repo owns Claude CLI execution and `claude_thread_id` recovery.
 - Codex repo owns Codex provider orchestration, app-server bridge tools, fleet snapshots, work items, and cron management.
 - Treat Claude/Codex thread IDs as soft state. Durable recovery knowledge belongs in repo files such as `docs/agent/STATE.md`.
+- As of 2026-07-29, the Claude bot intentionally ports the generic Codex manager/control-plane surface: topic dashboard, queue-topic routing, cron jobs, work items, topic-message storage, authenticated bridge, manager MCP bridge, and fleet snapshots.
+- Provider routing, Codex app-server behavior, and Codex token-usage accounting remain Codex-owned and are not part of the Claude manager port.
